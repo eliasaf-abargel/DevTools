@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # SQLite Database Container
+  sqlite:
+    image: alpine:latest
+    container_name: sftpgo-database
+    volumes:
+      - ./database:/database
+      - ./scripts/init-db.sh:/init-db.sh:ro
+    working_dir: /database
+    command: >
+      sh -c "
+        apk add --no-cache sqlite &&
+        if [ ! -f /database/sftpgo.db ]; then
+          echo 'Initializing SQLite database...' &&
+          sqlite3 /database/sftpgo.db 'SELECT 1;' > /dev/null 2>&1 &&
+          echo 'Database initialized successfully'
+        fi &&
+        echo 'SQLite container ready' &&
+        tail -f /dev/null
+      "
+    restart: unless-stopped
+    networks:
+      - sftpgo-network
+    healthcheck:
+      test: ["CMD", "sqlite3", "/database/sftpgo.db", "SELECT 1;"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # SFTPGo Main Application
+  sftpgo:
+    image: drakkan/sftpgo:latest
+    container_name: sftpgo-server
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+      - "${SFTP_PORT:-2022}:2022"
+    volumes:
+      - ./config/sftpgo.json:/etc/sftpgo/sftpgo.json:ro
+      - ./data:/srv/sftpgo/data
+      - ./logs:/var/log/sftpgo
+      - ./database:/var/lib/sftpgo
+    environment:
+      - SFTPGO_DEFAULT_ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - SFTPGO_DEFAULT_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN=true
+      - SFTPGO_LOG__LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      sqlite:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - sftpgo-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  sftpgo-network:
+    driver: bridge
+    name: sftpgo-network
+
+volumes:
+  sftpgo-database:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./database
+  sftpgo-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+  sftpgo-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./logs
