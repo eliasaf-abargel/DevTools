@@ -1,0 +1,978 @@
+/*
+========================================================================
+SQL PERMISSION MASTER PRO v1.0
+========================================================================
+🎯 Ultimate Dynamic SQL Server Permissions Management Tool
+   Professional-grade script for DevSecOps and Database Administration
+
+✨ FEATURES:
+   - SQL & Windows Authentication Support (Users/Groups)
+   - 6 Permission Levels (Read-Only to SysAdmin)
+   - SQL Server Agent Integration with granular control
+   - Advanced conflict detection and resolution
+   - Preview Mode for safe testing
+   - Comprehensive verification and reporting
+   - Production-ready with extensive error handling
+
+🛡️ SECURITY:
+   - Safe execution - only manages permissions, never touches data
+   - Built-in conflict resolution for existing users
+   - Preview mode to test changes before execution
+   - Comprehensive logging and verification
+
+📋 USE CASES:
+   - Onboarding new team members with appropriate access
+   - Managing Windows domain groups and SQL users
+   - Standardizing permissions across multiple databases
+   - Granting SQL Server Agent access for automation
+   - Auditing and verifying current permissions
+
+👥 AUTHOR: DevSecOps Community
+📅 VERSION: 1.0 (July 2025)
+🔗 REPOSITORY: https://github.com/your-org/sql-permission-master-pro
+📖 DOCUMENTATION: See accompanying README.md file
+
+========================================================================
+BEFORE RUNNING:
+1. Review the configuration section below
+2. Test in a development environment first
+3. Run with @PreviewMode = 1 to see what changes will be made
+4. Ensure you have sysadmin privileges to execute
+========================================================================
+*/
+
+SET NOCOUNT ON;
+
+-- =====================================================================
+-- 🎛️ CONFIGURATION SECTION - MODIFY THESE SETTINGS
+-- =====================================================================
+
+-- 👤 USER/GROUP SETTINGS
+DECLARE @LoginName NVARCHAR(128) = 'DOMAIN\username'    -- Change this to your user/group
+DECLARE @Password NVARCHAR(128) = 'YourStrongP@ssw0rd!' -- Only required for SQL Authentication
+DECLARE @AuthType VARCHAR(10) = 'WINDOWS'               -- Options: 'SQL' or 'WINDOWS'
+
+-- 🔐 PERMISSION LEVEL - Choose the appropriate access level:
+DECLARE @PermissionLevel VARCHAR(20) = 'READ_WRITE'
+/*
+AVAILABLE PERMISSION LEVELS:
+┌─────────────────┬─────────────────────────────────────────────────────────┐
+│ Level           │ Description                                             │
+├─────────────────┼─────────────────────────────────────────────────────────┤
+│ READ_ONLY       │ db_datareader - SELECT permissions only                │
+│ READ_WRITE      │ db_datareader + db_datawriter                          │
+│ READ_WRITE_DDL  │ Above + db_ddladmin + EXECUTE (create/modify objects) │
+│ FULL            │ Above + VIEW DEFINITION + additional permissions       │
+│ DB_OWNER        │ db_owner - Full database control                       │
+│ SYSADMIN        │ sysadmin - Full server control (⚠️ USE WITH CAUTION)   │
+└─────────────────┴─────────────────────────────────────────────────────────┘
+*/
+
+-- 🤖 SQL SERVER AGENT ACCESS
+DECLARE @GrantSQLAgentAccess BIT = 0                     -- 1 = Enable SQL Agent access, 0 = Disable
+DECLARE @SQLAgentLevel VARCHAR(20) = 'READER'
+/*
+SQL AGENT LEVELS:
+┌─────────┬─────────────────────────────────────────────────────────────────┐
+│ Level   │ Description                                                     │
+├─────────┼─────────────────────────────────────────────────────────────────┤
+│ USER    │ SQLAgentUserRole - Can manage only owned jobs                  │
+│ READER  │ Above + SQLAgentReaderRole - Can view all jobs                 │
+│ OPERATOR│ Above + SQLAgentOperatorRole - Can manage all jobs and proxies │
+└─────────┴─────────────────────────────────────────────────────────────────┘
+*/
+
+-- 🗄️ DATABASE SCOPE
+DECLARE @IncludeSystemDBs BIT = 0                        -- 1 = Include master/model/msdb, 0 = User databases only
+DECLARE @IncludeTempDB BIT = 0                           -- 1 = Include tempdb, 0 = Exclude tempdb
+
+-- 🔧 ADVANCED OPTIONS
+DECLARE @HandleConflicts BIT = 1                         -- 1 = Resolve user conflicts automatically, 0 = Skip conflicts
+DECLARE @PreviewMode BIT = 1                             -- 1 = PREVIEW ONLY (safe), 0 = Execute changes
+DECLARE @GrantViewServerState BIT = 1                    -- 1 = Grant VIEW SERVER STATE, 0 = No
+DECLARE @GrantShowPlan BIT = 0                           -- 1 = Grant SHOWPLAN permissions, 0 = No
+
+-- =====================================================================
+-- 📊 SCRIPT VARIABLES - DO NOT MODIFY BELOW THIS LINE
+-- =====================================================================
+DECLARE @sql NVARCHAR(MAX)
+DECLARE @dbname SYSNAME
+DECLARE @dbtype VARCHAR(20)
+DECLARE @error_count INT = 0
+DECLARE @success_count INT = 0
+DECLARE @total_dbs INT = 0
+DECLARE @conflict_count INT = 0
+DECLARE @permission_summary NVARCHAR(MAX) = ''
+
+-- =====================================================================
+-- 🎨 EXECUTION SUMMARY DISPLAY
+-- =====================================================================
+PRINT '========================================================================'
+PRINT 'SQL PERMISSION MASTER PRO v1.0 - EXECUTION SUMMARY'
+PRINT '========================================================================'
+PRINT 'Target Login: ' + @LoginName
+PRINT 'Authentication: ' + @AuthType + CASE WHEN @AuthType = 'SQL' THEN ' (Password configured)' ELSE ' (Domain authentication)' END
+PRINT 'Permission Level: ' + @PermissionLevel
+PRINT 'SQL Agent Access: ' + CASE WHEN @GrantSQLAgentAccess = 1 THEN 'YES (' + @SQLAgentLevel + ' level)' ELSE 'DISABLED' END
+PRINT 'System Databases: ' + CASE WHEN @IncludeSystemDBs = 1 THEN 'INCLUDED' ELSE 'EXCLUDED (recommended)' END
+PRINT 'TempDB: ' + CASE WHEN @IncludeTempDB = 1 THEN 'INCLUDED' ELSE 'EXCLUDED (recommended)' END
+PRINT 'Conflict Resolution: ' + CASE WHEN @HandleConflicts = 1 THEN 'ENABLED' ELSE 'DISABLED' END
+PRINT 'Execution Mode: ' + CASE WHEN @PreviewMode = 1 THEN 'PREVIEW ONLY (safe mode)' ELSE 'LIVE EXECUTION' END
+PRINT 'Server State Access: ' + CASE WHEN @GrantViewServerState = 1 THEN 'ENABLED' ELSE 'DISABLED' END
+PRINT 'ShowPlan Access: ' + CASE WHEN @GrantShowPlan = 1 THEN 'ENABLED' ELSE 'DISABLED' END
+PRINT '========================================================================'
+PRINT ''
+
+-- Safety check for dangerous operations
+IF @PermissionLevel = 'SYSADMIN' AND @PreviewMode = 0
+BEGIN
+    PRINT '⚠️  WARNING: You are about to grant SYSADMIN privileges!'
+    PRINT '⚠️  This gives FULL SERVER CONTROL to the specified login.'
+    PRINT '⚠️  Make sure this is intended and the login is secure.'
+    PRINT ''
+END
+
+-- =====================================================================
+-- STEP 1: SERVER LOGIN MANAGEMENT
+-- =====================================================================
+PRINT '>>> STEP 1: Processing Server Login [' + @LoginName + ']...'
+
+BEGIN TRY
+    USE [master]
+
+    -- Check if login already exists
+    IF EXISTS (SELECT * FROM sys.server_principals WHERE name = @LoginName)
+    BEGIN
+        PRINT 'INFO: Login [' + @LoginName + '] already exists in the system.'
+
+        IF @AuthType = 'SQL' AND @PreviewMode = 0
+        BEGIN
+            PRINT 'PREVIEW: Would update password for SQL login [' + @LoginName + ']'
+        END
+        ELSE IF @AuthType = 'SQL' AND @PreviewMode = 0
+        BEGIN
+            SET @sql = 'ALTER LOGIN [' + @LoginName + '] WITH PASSWORD = ''' + @Password + ''''
+            EXEC sp_executesql @sql
+            PRINT 'SUCCESS: Password updated for SQL login'
+        END
+        ELSE
+        BEGIN
+            PRINT 'INFO: Windows authentication - no password management required'
+        END
+    END
+    ELSE
+    BEGIN
+        IF @AuthType = 'SQL'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                PRINT 'PREVIEW: Would create SQL Server login [' + @LoginName + '] with specified password'
+            END
+            ELSE
+            BEGIN
+                SET @sql = 'CREATE LOGIN [' + @LoginName + '] WITH PASSWORD = ''' + @Password + ''',
+                    DEFAULT_DATABASE = [master],
+                    CHECK_EXPIRATION = OFF,
+                    CHECK_POLICY = ON'
+                EXEC sp_executesql @sql
+
+                SET @sql = 'ALTER LOGIN [' + @LoginName + '] ENABLE'
+                EXEC sp_executesql @sql
+
+                PRINT 'SUCCESS: SQL Server login [' + @LoginName + '] created and enabled'
+            END
+        END
+        ELSE IF @AuthType = 'WINDOWS'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                PRINT 'PREVIEW: Would create Windows login/group [' + @LoginName + ']'
+            END
+            ELSE
+            BEGIN
+                SET @sql = 'CREATE LOGIN [' + @LoginName + '] FROM WINDOWS'
+                EXEC sp_executesql @sql
+
+                PRINT 'SUCCESS: Windows login/group [' + @LoginName + '] created successfully'
+            END
+        END
+    END
+END TRY
+BEGIN CATCH
+    PRINT 'ERROR: Failed to process server login - ' + ERROR_MESSAGE()
+    SET @error_count = @error_count + 1
+END CATCH
+
+PRINT ''
+
+-- =====================================================================
+-- STEP 2: SERVER-LEVEL PERMISSIONS
+-- =====================================================================
+PRINT '>>> STEP 2: Configuring Server-Level Permissions...'
+
+BEGIN TRY
+    -- Handle SYSADMIN level (highest privilege)
+    IF @PermissionLevel = 'SYSADMIN'
+    BEGIN
+        IF @PreviewMode = 1
+        BEGIN
+            PRINT 'PREVIEW: Would grant SYSADMIN role (FULL SERVER CONTROL)'
+        END
+        ELSE
+        BEGIN
+            IF NOT IS_SRVROLEMEMBER('sysadmin', @LoginName) = 1
+            BEGIN
+                EXEC('ALTER SERVER ROLE [sysadmin] ADD MEMBER [' + @LoginName + ']')
+                PRINT 'SUCCESS: Added to sysadmin role - FULL SERVER CONTROL granted'
+                SET @permission_summary = @permission_summary + 'Server: SYSADMIN; '
+            END
+            ELSE
+            BEGIN
+                PRINT 'INFO: Already a member of sysadmin role'
+                SET @permission_summary = @permission_summary + 'Server: SYSADMIN (existing); '
+            END
+        END
+    END
+    ELSE
+    BEGIN
+        -- Standard server permissions for non-sysadmin users
+        IF @PreviewMode = 1
+        BEGIN
+            PRINT 'PREVIEW: Would grant CONNECT SQL permission'
+            IF @GrantViewServerState = 1
+                PRINT 'PREVIEW: Would grant VIEW SERVER STATE permission'
+            IF @GrantShowPlan = 1
+                PRINT 'PREVIEW: Would grant SHOWPLAN permissions'
+        END
+        ELSE
+        BEGIN
+            SET @sql = 'GRANT CONNECT SQL TO [' + @LoginName + ']'
+            EXEC sp_executesql @sql
+            PRINT 'SUCCESS: Granted CONNECT SQL permission'
+            SET @permission_summary = @permission_summary + 'Server: CONNECT SQL; '
+
+            IF @GrantViewServerState = 1
+            BEGIN
+                SET @sql = 'GRANT VIEW SERVER STATE TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                PRINT 'SUCCESS: Granted VIEW SERVER STATE permission'
+                SET @permission_summary = @permission_summary + 'VIEW SERVER STATE; '
+            END
+
+            IF @GrantShowPlan = 1
+            BEGIN
+                SET @sql = 'GRANT SHOWPLAN TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                SET @sql = 'GRANT VIEW SERVER STATE TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                PRINT 'SUCCESS: Granted SHOWPLAN permissions'
+                SET @permission_summary = @permission_summary + 'SHOWPLAN; '
+            END
+        END
+    END
+
+END TRY
+BEGIN CATCH
+    PRINT 'ERROR: Failed to configure server permissions - ' + ERROR_MESSAGE()
+    SET @error_count = @error_count + 1
+END CATCH
+
+PRINT ''
+
+-- =====================================================================
+-- STEP 3: SQL SERVER AGENT CONFIGURATION
+-- =====================================================================
+IF @GrantSQLAgentAccess = 1
+BEGIN
+    PRINT '>>> STEP 3: Configuring SQL Server Agent Access (' + @SQLAgentLevel + ' level)...'
+
+    BEGIN TRY
+        USE [msdb]
+
+        -- Check for existing user conflicts in msdb
+        DECLARE @existingUser NVARCHAR(128) = NULL
+        SELECT @existingUser = dp.name
+        FROM sys.database_principals dp
+        JOIN sys.server_principals sp ON dp.sid = sp.sid
+        WHERE sp.name = @LoginName AND dp.name != @LoginName AND dp.name != 'dbo'
+
+        IF @existingUser IS NOT NULL
+        BEGIN
+            PRINT 'WARNING: Conflicting user [' + @existingUser + '] found in msdb for login [' + @LoginName + ']'
+            IF @HandleConflicts = 1 AND @PreviewMode = 0
+            BEGIN
+                PRINT 'INFO: Resolving conflict by removing [' + @existingUser + '] from msdb'
+                EXEC('DROP USER [' + @existingUser + ']')
+                SET @conflict_count = @conflict_count + 1
+            END
+            ELSE IF @PreviewMode = 1
+            BEGIN
+                PRINT 'PREVIEW: Would resolve conflict by removing [' + @existingUser + '] from msdb'
+            END
+        END
+
+        -- Create user in msdb database
+        IF @PreviewMode = 1
+        BEGIN
+            PRINT 'PREVIEW: Would create/verify user in msdb database'
+        END
+        ELSE
+        BEGIN
+            IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = @LoginName)
+            BEGIN
+                EXEC('CREATE USER [' + @LoginName + '] FOR LOGIN [' + @LoginName + ']')
+                PRINT 'SUCCESS: User created in msdb database'
+            END
+            ELSE
+            BEGIN
+                PRINT 'INFO: User already exists in msdb database'
+            END
+        END
+
+        -- Grant SQL Agent roles based on specified level
+        IF @PreviewMode = 1
+        BEGIN
+            PRINT 'PREVIEW: Would grant SQL Agent roles for [' + @SQLAgentLevel + '] level'
+        END
+        ELSE
+        BEGIN
+            -- Basic level - all users get this
+            IF @SQLAgentLevel IN ('USER', 'READER', 'OPERATOR')
+            BEGIN
+                IF NOT IS_ROLEMEMBER('SQLAgentUserRole', @LoginName) = 1
+                BEGIN
+                    EXEC('ALTER ROLE SQLAgentUserRole ADD MEMBER [' + @LoginName + ']')
+                    PRINT 'SUCCESS: Added to SQLAgentUserRole (basic job access)'
+                END
+            END
+
+            -- Reader level and above
+            IF @SQLAgentLevel IN ('READER', 'OPERATOR')
+            BEGIN
+                IF NOT IS_ROLEMEMBER('SQLAgentReaderRole', @LoginName) = 1
+                BEGIN
+                    EXEC('ALTER ROLE SQLAgentReaderRole ADD MEMBER [' + @LoginName + ']')
+                    PRINT 'SUCCESS: Added to SQLAgentReaderRole (view all jobs)'
+                END
+            END
+
+            -- Operator level (highest)
+            IF @SQLAgentLevel = 'OPERATOR'
+            BEGIN
+                IF NOT IS_ROLEMEMBER('SQLAgentOperatorRole', @LoginName) = 1
+                BEGIN
+                    EXEC('ALTER ROLE SQLAgentOperatorRole ADD MEMBER [' + @LoginName + ']')
+                    PRINT 'SUCCESS: Added to SQLAgentOperatorRole (manage all jobs)'
+                END
+
+                -- Additional operator permissions
+                SET @sql = 'GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.sysjobs TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                SET @sql = 'GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.sysjobsteps TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                SET @sql = 'GRANT EXECUTE ON dbo.sp_start_job TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+                SET @sql = 'GRANT EXECUTE ON dbo.sp_stop_job TO [' + @LoginName + ']'
+                EXEC sp_executesql @sql
+
+                PRINT 'SUCCESS: Granted advanced SQL Agent operator permissions'
+            END
+        END
+
+        SET @permission_summary = @permission_summary + 'SQL Agent: ' + @SQLAgentLevel + '; '
+
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR: Failed to configure SQL Agent access - ' + ERROR_MESSAGE()
+        SET @error_count = @error_count + 1
+    END CATCH
+
+    PRINT ''
+END
+ELSE
+BEGIN
+    PRINT '>>> STEP 3: SQL Server Agent Access - DISABLED (as configured)'
+    PRINT ''
+END
+
+-- =====================================================================
+-- STEP 4: DATABASE DISCOVERY AND PREPARATION
+-- =====================================================================
+PRINT '>>> STEP 4: Discovering Databases and Preparing Access List...'
+
+CREATE TABLE #DatabaseList (DatabaseName SYSNAME, DatabaseType VARCHAR(20))
+
+-- Build comprehensive database list based on configuration
+INSERT INTO #DatabaseList (DatabaseName, DatabaseType)
+SELECT
+    d.name,
+    CASE
+        WHEN d.name IN ('master', 'model', 'msdb') THEN 'SYSTEM'
+        WHEN d.name = 'tempdb' THEN 'TEMPORARY'
+        ELSE 'USER'
+    END
+FROM sys.databases d
+WHERE d.state = 0  -- Only online databases
+  AND (
+    -- Always include user databases
+    d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+    OR
+    -- Include system databases if requested
+    (d.name IN ('master', 'model', 'msdb') AND @IncludeSystemDBs = 1)
+    OR
+    -- Include tempdb if requested
+    (d.name = 'tempdb' AND @IncludeTempDB = 1)
+  )
+ORDER BY
+  CASE
+    WHEN d.name = 'master' THEN 1
+    WHEN d.name IN ('model', 'msdb') THEN 2
+    WHEN d.name = 'tempdb' THEN 3
+    ELSE 4
+  END,
+  d.name
+
+SELECT @total_dbs = COUNT(*) FROM #DatabaseList
+
+PRINT 'Total databases identified: ' + CAST(@total_dbs AS VARCHAR(10))
+
+-- Display database list
+DECLARE @db_list NVARCHAR(MAX) = ''
+SELECT @db_list = @db_list + '  - ' + DatabaseName + ' (' + DatabaseType + ')' + CHAR(13) + CHAR(10)
+FROM #DatabaseList ORDER BY DatabaseName
+
+PRINT 'Databases to be configured:'
+PRINT @db_list
+PRINT ''
+
+-- =====================================================================
+-- STEP 5: DATABASE PERMISSIONS APPLICATION
+-- =====================================================================
+PRINT '>>> STEP 5: Applying Database Permissions (Level: ' + @PermissionLevel + ')...'
+
+DECLARE db_cursor CURSOR FOR
+SELECT DatabaseName, DatabaseType FROM #DatabaseList ORDER BY DatabaseName
+
+OPEN db_cursor
+FETCH NEXT FROM db_cursor INTO @dbname, @dbtype
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    PRINT '--- Processing Database: [' + @dbname + '] (' + @dbtype + ') ---'
+
+    BEGIN TRY
+        -- Build dynamic SQL for database-specific operations
+        SET @sql = '
+        USE [' + @dbname + '];
+
+        -- Check for user conflicts (login mapped to different username)
+        DECLARE @conflictUser NVARCHAR(128) = NULL;
+        SELECT @conflictUser = dp.name
+        FROM sys.database_principals dp
+        JOIN sys.server_principals sp ON dp.sid = sp.sid
+        WHERE sp.name = ''' + @LoginName + ''' AND dp.name != ''' + @LoginName + ''' AND dp.name != ''dbo'';
+
+        IF @conflictUser IS NOT NULL
+        BEGIN
+            PRINT ''WARNING: Login [' + @LoginName + '] mapped to different user ['' + @conflictUser + ''] in [' + @dbname + ']'';'
+
+        IF @HandleConflicts = 1
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''PREVIEW: Would resolve conflict by removing user ['' + @conflictUser + '']'';'
+            END
+            ELSE
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''INFO: Resolving conflict by removing user ['' + @conflictUser + '']'';
+                EXEC(''DROP USER ['' + @conflictUser + '']'');'
+            END
+        END
+
+        SET @sql = @sql + '
+        END;
+
+        -- Handle special case where login is mapped to dbo user
+        DECLARE @dboMapped BIT = 0;
+        SELECT @dboMapped = 1
+        FROM sys.database_principals dp
+        JOIN sys.server_principals sp ON dp.sid = sp.sid
+        WHERE sp.name = ''' + @LoginName + ''' AND dp.name = ''dbo'';
+
+        IF @dboMapped = 1
+        BEGIN
+            PRINT ''INFO: Login [' + @LoginName + '] mapped to dbo user - inherits database owner privileges'';
+        END
+        ELSE
+        BEGIN'
+
+        IF @PreviewMode = 1
+        BEGIN
+            SET @sql = @sql + '
+            IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = ''' + @LoginName + ''')
+            BEGIN
+                PRINT ''PREVIEW: Would create user [' + @LoginName + '] in database [' + @dbname + ']'';
+            END
+            ELSE
+            BEGIN
+                PRINT ''INFO: User [' + @LoginName + '] already exists in [' + @dbname + ']'';
+            END;'
+        END
+        ELSE
+        BEGIN
+            SET @sql = @sql + '
+            IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = ''' + @LoginName + ''')
+            BEGIN
+                CREATE USER [' + @LoginName + '] FOR LOGIN [' + @LoginName + '];
+                PRINT ''SUCCESS: User [' + @LoginName + '] created in [' + @dbname + ']'';
+            END
+            ELSE
+            BEGIN
+                PRINT ''INFO: User [' + @LoginName + '] already exists in [' + @dbname + ']'';
+            END;'
+        END
+
+        SET @sql = @sql + '
+        END;'
+
+        -- Apply permissions based on specified level
+        IF @PermissionLevel = 'READ_ONLY'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''PREVIEW: Would grant db_datareader role (SELECT permissions only)'';'
+            END
+            ELSE
+            BEGIN
+                SET @sql = @sql + '
+                IF NOT IS_ROLEMEMBER(''db_datareader'', ''' + @LoginName + ''') = 1 AND @dboMapped = 0
+                BEGIN
+                    ALTER ROLE db_datareader ADD MEMBER [' + @LoginName + '];
+                    PRINT ''SUCCESS: Granted db_datareader role (READ ONLY access)'';
+                END
+                ELSE IF @dboMapped = 0
+                BEGIN
+                    PRINT ''INFO: Already has db_datareader privileges'';
+                END;'
+            END
+        END
+        ELSE IF @PermissionLevel = 'READ_WRITE'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''PREVIEW: Would grant db_datareader + db_datawriter roles'';'
+            END
+            ELSE
+            BEGIN
+                SET @sql = @sql + '
+                IF @dboMapped = 0
+                BEGIN
+                    IF NOT IS_ROLEMEMBER(''db_datareader'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datareader ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datareader role'';
+                    END;
+                    IF NOT IS_ROLEMEMBER(''db_datawriter'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datawriter ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datawriter role'';
+                    END;
+                END;'
+            END
+        END
+        ELSE IF @PermissionLevel = 'READ_WRITE_DDL'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''PREVIEW: Would grant data access + DDL permissions + EXECUTE'';'
+            END
+            ELSE
+            BEGIN
+                SET @sql = @sql + '
+                IF @dboMapped = 0
+                BEGIN
+                    IF NOT IS_ROLEMEMBER(''db_datareader'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datareader ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datareader role'';
+                    END;
+                    IF NOT IS_ROLEMEMBER(''db_datawriter'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datawriter ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datawriter role'';
+                    END;
+                    IF NOT IS_ROLEMEMBER(''db_ddladmin'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_ddladmin ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_ddladmin role (DDL operations)'';
+                    END;
+                    GRANT EXECUTE TO [' + @LoginName + '];
+                    PRINT ''SUCCESS: Granted EXECUTE permissions'';
+                END;'
+            END
+        END
+        ELSE IF @PermissionLevel = 'FULL'
+        BEGIN
+            IF @PreviewMode = 1
+            BEGIN
+                SET @sql = @sql + '
+                PRINT ''PREVIEW: Would grant comprehensive database access with all permissions'';'
+            END
+            ELSE
+            BEGIN
+                SET @sql = @sql + '
+                IF @dboMapped = 0
+                BEGIN
+                    IF NOT IS_ROLEMEMBER(''db_datareader'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datareader ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datareader role'';
+                    END;
+                    IF NOT IS_ROLEMEMBER(''db_datawriter'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_datawriter ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_datawriter role'';
+                    END;
+                    IF NOT IS_ROLEMEMBER(''db_ddladmin'', ''' + @LoginName + ''') = 1
+                    BEGIN
+                        ALTER ROLE db_ddladmin ADD MEMBER [' + @LoginName + '];
+                        PRINT ''SUCCESS: Granted db_ddladmin role'';
+                    END;
+                    GRANT EXECUTE TO [' + @LoginName + '];
+                    GRANT VIEW DEFINITION TO [' + @LoginName + '];
+                    PRINT ''SUCCESS: Granted EXECUTE and VIEW DEFINITION permissions'';
+                END;'
+            END
+        END
+        ELSE IF @PermissionLevel = 'DB_OWNER'
+        BEGIN
+            -- Special handling for tempdb (cannot grant db_owner)
+            IF @dbname = 'tempdb'
+            BEGIN
+                IF @PreviewMode = 1
+                BEGIN
+                    SET @sql = @sql + '
+                    PRINT ''PREVIEW: Would grant alternative permissions for tempdb (db_owner not applicable)'';'
+                END
+                ELSE
+                BEGIN
+                    SET @sql = @sql + '
+                    IF @dboMapped = 0
+                    BEGIN
+                        PRINT ''INFO: Granting alternative permissions for tempdb (db_owner not applicable)'';
+                        IF NOT IS_ROLEMEMBER(''db_datareader'', ''' + @LoginName + ''') = 1
+                        BEGIN
+                            ALTER ROLE db_datareader ADD MEMBER [' + @LoginName + '];
+                            PRINT ''SUCCESS: Granted db_datareader role'';
+                        END;
+                        IF NOT IS_ROLEMEMBER(''db_datawriter'', ''' + @LoginName + ''') = 1
+                        BEGIN
+                            ALTER ROLE db_datawriter ADD MEMBER [' + @LoginName + '];
+                            PRINT ''SUCCESS: Granted db_datawriter role'';
+                        END;
+                    END;'
+                END
+            END
+            ELSE
+            BEGIN
+                IF @PreviewMode = 1
+                BEGIN
+                    SET @sql = @sql + '
+                    PRINT ''PREVIEW: Would grant db_owner role (full database control)'';'
+                END
+                ELSE
+                BEGIN
+                    SET @sql = @sql + '
+                    IF @dboMapped = 1
+                    BEGIN
+                        PRINT ''INFO: Login mapped to dbo user - already has database owner privileges'';
+                    END
+                    ELSE
+                    BEGIN
+                        IF NOT IS_ROLEMEMBER(''db_owner'', ''' + @LoginName + ''') = 1
+                        BEGIN
+                            ALTER ROLE db_owner ADD MEMBER [' + @LoginName + '];
+                            PRINT ''SUCCESS: Granted db_owner role (FULL DATABASE CONTROL)'';
+                        END
+                        ELSE
+                        BEGIN
+                            PRINT ''INFO: Already has db_owner privileges'';
+                        END;
+                    END;'
+                END
+            END
+        END
+
+        SET @sql = @sql + '
+        PRINT ''=== [' + @dbname + '] configuration completed ==='';'
+
+        -- Execute the dynamic SQL
+        EXEC sp_executesql @sql
+        SET @success_count = @success_count + 1
+
+    END TRY
+    BEGIN CATCH
+        SET @error_count = @error_count + 1
+        PRINT 'ERROR processing [' + @dbname + ']: ' + ERROR_MESSAGE()
+    END CATCH
+
+    PRINT ''
+    FETCH NEXT FROM db_cursor INTO @dbname, @dbtype
+END
+
+CLOSE db_cursor
+DEALLOCATE db_cursor
+
+-- =====================================================================
+-- STEP 6: COMPREHENSIVE VERIFICATION AND REPORTING
+-- =====================================================================
+IF @PreviewMode = 0
+BEGIN
+    PRINT '>>> STEP 6: Verification and Access Summary...'
+    PRINT ''
+
+    -- Verify permissions in each configured database
+    DECLARE verify_cursor CURSOR FOR
+    SELECT DatabaseName FROM #DatabaseList ORDER BY DatabaseName
+
+    OPEN verify_cursor
+    FETCH NEXT FROM verify_cursor INTO @dbname
+
+    PRINT 'PERMISSION VERIFICATION RESULTS:'
+    PRINT '================================'
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @sql = '
+        USE [' + @dbname + '];
+
+        IF EXISTS (SELECT * FROM sys.database_principals WHERE name = ''' + @LoginName + ''')
+           OR EXISTS (SELECT * FROM sys.database_principals dp
+                     JOIN sys.server_principals sp ON dp.sid = sp.sid
+                     WHERE sp.name = ''' + @LoginName + ''' AND dp.name = ''dbo'')
+        BEGIN
+            SELECT
+                ''' + @dbname + ''' as DatabaseName,
+                CASE
+                    WHEN dp.name = ''dbo'' THEN ''dbo (Database Owner)''
+                    ELSE ''' + @LoginName + '''
+                END as UserName,
+                r.name as RoleName,
+                ''ACTIVE'' as Status
+            FROM sys.database_role_members rm
+            JOIN sys.database_principals r ON rm.role_principal_id = r.principal_id
+            JOIN sys.database_principals dp ON rm.member_principal_id = dp.principal_id
+            JOIN sys.server_principals sp ON dp.sid = sp.sid
+            WHERE sp.name = ''' + @LoginName + '''
+
+            UNION ALL
+
+            SELECT
+                ''' + @dbname + ''' as DatabaseName,
+                ''dbo (Database Owner)'' as UserName,
+                ''Database Owner'' as RoleName,
+                ''ACTIVE'' as Status
+            FROM sys.database_principals dp
+            JOIN sys.server_principals sp ON dp.sid = sp.sid
+            WHERE sp.name = ''' + @LoginName + ''' AND dp.name = ''dbo''
+
+            ORDER BY RoleName;
+        END'
+
+        EXEC sp_executesql @sql
+
+        FETCH NEXT FROM verify_cursor INTO @dbname
+    END
+
+    CLOSE verify_cursor
+    DEALLOCATE verify_cursor
+END
+
+-- Clean up temporary objects
+DROP TABLE #DatabaseList
+
+-- Build final permission summary
+SET @permission_summary = @permission_summary + 'Databases: ' + @PermissionLevel + '; '
+
+-- =====================================================================
+-- FINAL EXECUTION SUMMARY AND RECOMMENDATIONS
+-- =====================================================================
+PRINT ''
+PRINT '========================================================================'
+PRINT 'EXECUTION SUMMARY - SQL PERMISSION MASTER PRO v1.0'
+PRINT '========================================================================'
+PRINT 'Target Login: ' + @LoginName + ' (' + @AuthType + ' Authentication)'
+PRINT 'Execution Mode: ' + CASE WHEN @PreviewMode = 1 THEN 'PREVIEW ONLY' ELSE 'LIVE EXECUTION' END
+PRINT 'Databases Processed: ' + CAST(@total_dbs AS VARCHAR(10))
+PRINT 'Successful Operations: ' + CAST(@success_count AS VARCHAR(10))
+PRINT 'Failed Operations: ' + CAST(@error_count AS VARCHAR(10))
+IF @HandleConflicts = 1
+    PRINT 'Conflicts Resolved: ' + CAST(@conflict_count AS VARCHAR(10))
+PRINT ''
+
+IF @error_count = 0 AND @PreviewMode = 0
+BEGIN
+    PRINT 'STATUS: ALL PERMISSIONS SUCCESSFULLY CONFIGURED!'
+    PRINT ''
+    PRINT 'ACCESS CONFIGURATION SUMMARY:'
+
+    -- Server-level access summary
+    IF @PermissionLevel = 'SYSADMIN'
+    BEGIN
+        PRINT '🖥️  Server Level: SYSADMIN (FULL SERVER CONTROL)'
+        PRINT '    ⚠️  CAUTION: This user has unrestricted access to the entire SQL Server instance'
+    END
+    ELSE
+    BEGIN
+        PRINT '🖥️  Server Level: Standard User Access'
+        PRINT '    ✓ CONNECT SQL (can establish connections)'
+        IF @GrantViewServerState = 1
+            PRINT '    ✓ VIEW SERVER STATE (can view server performance data)'
+        IF @GrantShowPlan = 1
+            PRINT '    ✓ SHOWPLAN (can view execution plans)'
+    END
+
+    -- SQL Agent access summary
+    IF @GrantSQLAgentAccess = 1
+    BEGIN
+        PRINT ''
+        PRINT '🤖 SQL Server Agent: ' + @SQLAgentLevel + ' LEVEL ACCESS'
+        IF @SQLAgentLevel = 'USER'
+            PRINT '    ✓ Can create and manage own jobs only'
+        ELSE IF @SQLAgentLevel = 'READER'
+        BEGIN
+            PRINT '    ✓ Can create and manage own jobs'
+            PRINT '    ✓ Can view all jobs in the system'
+        END
+        ELSE IF @SQLAgentLevel = 'OPERATOR'
+        BEGIN
+            PRINT '    ✓ Can create and manage own jobs'
+            PRINT '    ✓ Can view all jobs in the system'
+            PRINT '    ✓ Can start/stop/modify any job'
+            PRINT '    ✓ Can manage job schedules and operators'
+        END
+    END
+    ELSE
+    BEGIN
+        PRINT ''
+        PRINT '🤖 SQL Server Agent: NO ACCESS (disabled by configuration)'
+    END
+
+    -- Database access summary
+    PRINT ''
+    PRINT '🗄️  Database Access: ' + @PermissionLevel + ' LEVEL'
+    IF @PermissionLevel = 'READ_ONLY'
+    BEGIN
+        PRINT '    ✓ SELECT (read data from all tables and views)'
+    END
+    ELSE IF @PermissionLevel = 'READ_WRITE'
+    BEGIN
+        PRINT '    ✓ SELECT (read data from all tables and views)'
+        PRINT '    ✓ INSERT/UPDATE/DELETE (modify data in all tables)'
+    END
+    ELSE IF @PermissionLevel = 'READ_WRITE_DDL'
+    BEGIN
+        PRINT '    ✓ SELECT (read data from all tables and views)'
+        PRINT '    ✓ INSERT/UPDATE/DELETE (modify data in all tables)'
+        PRINT '    ✓ CREATE/ALTER/DROP (manage database objects)'
+        PRINT '    ✓ EXECUTE (run stored procedures and functions)'
+    END
+    ELSE IF @PermissionLevel = 'FULL'
+    BEGIN
+        PRINT '    ✓ SELECT (read data from all tables and views)'
+        PRINT '    ✓ INSERT/UPDATE/DELETE (modify data in all tables)'
+        PRINT '    ✓ CREATE/ALTER/DROP (manage database objects)'
+        PRINT '    ✓ EXECUTE (run stored procedures and functions)'
+        PRINT '    ✓ VIEW DEFINITION (see object definitions and metadata)'
+    END
+    ELSE IF @PermissionLevel = 'DB_OWNER'
+    BEGIN
+        PRINT '    ✓ FULL DATABASE CONTROL (all operations within each database)'
+    END
+    ELSE IF @PermissionLevel = 'SYSADMIN'
+    BEGIN
+        PRINT '    ✓ UNLIMITED ACCESS (via server-level sysadmin privileges)'
+    END
+
+    -- Database scope summary
+    PRINT ''
+    PRINT '📦 Database Scope:'
+
+    -- Calculate database counts
+    DECLARE @user_db_count INT
+    DECLARE @system_db_count INT
+
+    SELECT @user_db_count = COUNT(*) FROM #DatabaseList WHERE DatabaseType = 'USER'
+    SELECT @system_db_count = COUNT(*) FROM #DatabaseList WHERE DatabaseType = 'SYSTEM'
+
+    PRINT '    ✓ User Databases: ' + CAST(@user_db_count AS VARCHAR(10)) + ' configured'
+    IF @IncludeSystemDBs = 1
+        PRINT '    ✓ System Databases: Included (master, model, msdb) - ' + CAST(@system_db_count AS VARCHAR(10)) + ' configured'
+    ELSE
+        PRINT '    - System Databases: Excluded (recommended for security)'
+    IF @IncludeTempDB = 1
+        PRINT '    ✓ TempDB: Included'
+    ELSE
+        PRINT '    - TempDB: Excluded (recommended for security)'
+
+    -- Connection information
+    PRINT ''
+    PRINT '📋 CONNECTION INFORMATION:'
+    PRINT '    Server: ' + @@SERVERNAME
+    PRINT '    Login: ' + @LoginName
+    IF @AuthType = 'SQL'
+        PRINT '    Password: [Configured as specified]'
+    PRINT '    Authentication Method: ' + @AuthType
+
+END
+ELSE IF @PreviewMode = 1
+BEGIN
+    PRINT 'STATUS: PREVIEW COMPLETED - NO CHANGES WERE MADE'
+    PRINT ''
+    PRINT '📋 NEXT STEPS:'
+    PRINT '1. Review the preview output above'
+    PRINT '2. If satisfied, set @PreviewMode = 0 and run again'
+    PRINT '3. Verify permissions after execution using the verification queries'
+    PRINT ''
+    PRINT '⚠️  IMPORTANT: Always test in a development environment first!'
+END
+ELSE
+BEGIN
+    PRINT 'STATUS: COMPLETED WITH ERRORS'
+    PRINT ''
+    PRINT '🔍 TROUBLESHOOTING:'
+    PRINT '1. Review error messages above for specific issues'
+    PRINT '2. Verify login has appropriate privileges for requested operations'
+    PRINT '3. Check for naming conflicts or authentication issues'
+    PRINT '4. Consult the documentation for common solutions'
+    PRINT ''
+    PRINT '✅ Successful Operations: ' + CAST(@success_count AS VARCHAR(10))
+    PRINT '❌ Failed Operations: ' + CAST(@error_count AS VARCHAR(10))
+    IF @HandleConflicts = 1
+        PRINT '🔧 Conflicts Resolved: ' + CAST(@conflict_count AS VARCHAR(10))
+END
+
+PRINT ''
+PRINT '========================================================================'
+PRINT '📖 DOCUMENTATION & SUPPORT:'
+PRINT '   README: See SQL-PermissionMaster-Pro.md for detailed documentation'
+PRINT '   Examples: Check example configurations in the documentation'
+PRINT '   Issues: Report issues at the project repository'
+PRINT ''
+PRINT '🔄 TO CONFIGURE ADDITIONAL USERS:'
+PRINT '   1. Update the @LoginName and related configuration parameters'
+PRINT '   2. Choose appropriate @PermissionLevel for the user/group'
+PRINT '   3. Run this script again (it''s safe for multiple executions)'
+PRINT ''
+PRINT '⚡ PERMISSION LEVELS: READ_ONLY | READ_WRITE | READ_WRITE_DDL | FULL | DB_OWNER | SYSADMIN'
+PRINT '🔐 AUTHENTICATION: SQL (username/password) | WINDOWS (domain users/groups)'
+PRINT '========================================================================'
+PRINT '⏰ Execution completed: ' + CONVERT(VARCHAR(30), GETDATE(), 120)
+PRINT '========================================================================'
+
+SET NOCOUNT OFF;
